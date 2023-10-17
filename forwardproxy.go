@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -47,6 +46,10 @@ import (
 
 func init() {
 	caddy.RegisterModule(Handler{})
+
+	// Used for generating padding lengths. Not needed to be cryptographically secure.
+	// Does not care about double seeding.
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 }
 
 // Handler implements a forward proxy.
@@ -288,18 +291,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		// HTTP CONNECT Fast Open. We merely close the connection if Open fails.
-		wFlusher, ok := w.(http.Flusher)
-		if !ok {
-			return caddyhttp.Error(http.StatusInternalServerError,
-				fmt.Errorf("ResponseWriter doesn't implement http.Flusher"))
-		}
+		rc := http.NewResponseController(w)
 		// Creates a padding of [30, 30+32)
 		paddingLen := rand.Intn(32) + 30
 		padding := make([]byte, paddingLen)
 		bits := rand.Uint64()
 		for i := 0; i < 16; i++ {
 			// Codes that won't be Huffman coded.
-			padding[i] = "!#$()+<>?@[]^`{}"[bits & 15]
+			padding[i] = "!#$()+<>?@[]^`{}"[bits&15]
 			bits >>= 4
 		}
 		for i := 16; i < paddingLen; i++ {
@@ -307,7 +306,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		w.Header().Set("Padding", string(padding))
 		w.WriteHeader(http.StatusOK)
-		wFlusher.Flush()
+		err := rc.Flush()
+		if err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf(err.Error()))
+		}
 
 		hostPort := r.URL.Host
 		if hostPort == "" {
@@ -371,13 +373,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			// make sure request is idempotent and could be retried by saving the Body
 			// None of those methods are supposed to have body,
 			// but we still need to copy the r.Body, even if it's empty
-			rBodyBuf, err := ioutil.ReadAll(r.Body)
+			rBodyBuf, err := io.ReadAll(r.Body)
 			if err != nil {
 				return caddyhttp.Error(http.StatusBadRequest,
 					fmt.Errorf("failed to read request body: %v", err))
 			}
 			r.GetBody = func() (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewReader(rBodyBuf)), nil
+				return io.NopCloser(bytes.NewReader(rBodyBuf)), nil
 			}
 			r.Body, _ = r.GetBody()
 		}
@@ -574,11 +576,8 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
 func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		return caddyhttp.Error(http.StatusInternalServerError,
-			fmt.Errorf("ResponseWriter does not implement http.Hijacker"))
-	}
+	hijacker := http.NewResponseController(w)
+
 	clientConn, bufReader, err := hijacker.Hijack()
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
@@ -616,9 +615,9 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
 }
 
 const (
-	NoPadding = 0
-	AddPadding = 1
-	RemovePadding = 2
+	NoPadding        = 0
+	AddPadding       = 1
+	RemovePadding    = 2
 	NumFirstPaddings = 8
 )
 
@@ -637,7 +636,7 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		}
 		return _err
 	}
-	if (padding) {
+	if padding {
 		go stream(target, clientReader, RemovePadding)
 		return stream(clientWriter, target, AddPadding)
 	} else {
@@ -659,7 +658,7 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 	for {
 		var nr int
 		var er error
-		if (paddingType == AddPadding && numPadding < NumFirstPaddings) {
+		if paddingType == AddPadding && numPadding < NumFirstPaddings {
 			numPadding++
 			paddingSize := rand.Intn(256)
 			maxRead := 65536 - 3 - paddingSize
@@ -669,15 +668,15 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 				buf[1] = byte(nr % 256)
 				buf[2] = byte(paddingSize)
 				for i := 0; i < paddingSize; i++ {
-					buf[3 + nr + i] = 0
+					buf[3+nr+i] = 0
 				}
 				nr += 3 + paddingSize
 			}
-		} else if (paddingType == RemovePadding && numPadding < NumFirstPaddings) {
+		} else if paddingType == RemovePadding && numPadding < NumFirstPaddings {
 			numPadding++
 			nr, er = io.ReadFull(src, buf[0:3])
 			if nr > 0 {
-				nr = int(buf[0]) * 256 + int(buf[1])
+				nr = int(buf[0])*256 + int(buf[1])
 				paddingSize := int(buf[2])
 				nr, er = io.ReadFull(src, buf[0:nr])
 				if nr > 0 {
